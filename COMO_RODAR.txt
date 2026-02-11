@@ -1,0 +1,66 @@
+============================================================
+   GUIA DE INICIALIZAÇÃO - TRADERBOT V3 (MANUAL DE OPERAÇÃO)
+============================================================
+
+PRÉ-REQUISITOS:
+1. Certifique-se de que o Docker ou os terminais antigos estão fechados.
+2. Verifique se o arquivo .env está configurado com suas chaves.
+
+------------------------------------------------------------
+PASSO 1: ABRIR O PROJETO
+------------------------------------------------------------
+Abra a pasta do projeto (E:\CryptoBotPro) no VS Code.
+Abra 3 TERMINAIS novos (Terminal > New Terminal).
+
+------------------------------------------------------------
+PASSO 2: ATIVAR O AMBIENTE VIRTUAL (PYTHON)
+------------------------------------------------------------
+Antes de rodar qualquer comando Python, você PRECISA ativar o venv.
+Digite isso nos Terminais 1 e 2:
+
+   .\venv\Scripts\activate
+
+(Se aparecer um (venv) verde no começo da linha, funcionou).
+
+------------------------------------------------------------
+PASSO 3: INICIAR OS MÓDULOS (UM EM CADA TERMINAL)
+------------------------------------------------------------
+
+🖥️ TERMINAL 1: A API (O Servidor de Dados)
+   Este terminal fornece os dados para o site.
+   Comando:
+   uvicorn api:app --reload --host 0.0.0.0 --port 8000
+
+   > Aguarde aparecer: "Application startup complete".
+
+🤖 TERMINAL 2: O ROBÔ (O Trader)
+   Este terminal faz as compras, vendas e análises.
+   Comando:
+   python main.py
+
+   > Aguarde aparecer: "TRADERBOT V3.5 - ROBUST EDITION".
+
+🎨 TERMINAL 3: O DASHBOARD (O Site)
+   Este terminal roda a interface visual.
+   Comando:
+   cd dashboard-crypto
+   npm run dev
+
+   > Aguarde aparecer: "Ready in..." e "http://localhost:3000".
+
+------------------------------------------------------------
+PASSO 4: ACESSAR
+------------------------------------------------------------
+Abra seu navegador e digite:
+http://localhost:3000
+
+------------------------------------------------------------
+RESUMO DE COMANDOS ÚTEIS
+------------------------------------------------------------
+- Parar um terminal: Clique no terminal e aperte Ctrl + C
+- Instalar nova biblioteca Python: pip install nome_da_lib
+- Atualizar tudo: pip freeze > requirements.txt
+
+============================================================
+                 BOAS OPERAÇÕES! 🚀
+============================================================

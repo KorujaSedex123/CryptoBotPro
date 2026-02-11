@@ -1,139 +1,114 @@
 import sqlite3
-import pandas as pd
-from datetime import datetime
+import json
 
 DB_NAME = "trades.db"
 
-def conectar():
-    """Conecta ao banco com WAL ativado"""
-    # Ajuste do caminho dependendo de onde chama
-    caminho = f"../{DB_NAME}" if __name__ == "__main__" else DB_NAME
-    if __name__ == "__main__": caminho = DB_NAME # Se rodar direto na pasta modules
-    
-    conn = sqlite3.connect(caminho)
-    conn.execute("PRAGMA journal_mode=WAL;") 
+def get_connection():
+    """Retorna conexão com modo WAL ativado para evitar travamentos"""
+    conn = sqlite3.connect(DB_NAME)
+    # Ativa o modo WAL (Leitura e Escrita simultâneas)
+    conn.execute("PRAGMA journal_mode=WAL;")
     return conn
 
 def criar_tabelas():
-    try:
-        conn = sqlite3.connect(DB_NAME) # Cria na raiz se chamado do main
-        cursor = conn.cursor()
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS trades (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                symbol TEXT,
-                tipo TEXT,
-                preco REAL,
-                quantidade REAL,
-                lucro REAL,
-                data_hora TEXT
-            )
-        ''')
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    # Tabela de Trades
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT,
+            tipo TEXT,
+            preco REAL,
+            quantidade REAL,
+            lucro REAL,
+            data_hora TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # Tabela de Memória (Estado do Bot)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS memoria_bot (
+            id INTEGER PRIMARY KEY,
+            saldo REAL,
+            posicao INTEGER,
+            preco_compra REAL,
+            qtd_btc REAL,
+            preco_maximo REAL
+        )
+    ''')
 
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS status_ia (
-                id INTEGER PRIMARY KEY,
-                rsi REAL,
-                potencial REAL,
-                decisao TEXT,
-                atualizado_em TEXT
-            )
-        ''')
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS memoria_bot (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                saldo REAL,
-                posicao BOOLEAN,
-                preco_compra REAL,
-                qtd_btc REAL,
-                preco_maximo REAL,
-                ultima_atualizacao TEXT
-            )
-        ''')
+    # Tabela da Mente da IA (Novo Cérebro V3)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS status_ia (
+            id INTEGER PRIMARY KEY,
+            rsi REAL,
+            potencial REAL, -- Agora usado como SCORE
+            decisao TEXT,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # Inicializa memória se não existir
+    cursor.execute("SELECT count(*) FROM memoria_bot")
+    if cursor.fetchone()[0] == 0:
+        cursor.execute("INSERT INTO memoria_bot (id, saldo, posicao, preco_compra, qtd_btc, preco_maximo) VALUES (1, 100.0, 0, 0, 0, 0)")
         
-        # Cria a linha inicial se não existir (Começa zerado)
-        cursor.execute('''
-            INSERT OR IGNORE INTO memoria_bot (id, saldo, posicao, preco_compra, qtd_btc, preco_maximo, ultima_atualizacao)
-            VALUES (1, 100.0, 0, 0.0, 0.0, 0.0, datetime('now'))
-        ''')
-        conn.commit()
-        conn.close()
-        print("📂 Banco de dados pronto.")
-    except Exception as e:
-        print(f"Erro ao criar banco: {e}")
+    # Inicializa IA se não existir
+    cursor.execute("SELECT count(*) FROM status_ia")
+    if cursor.fetchone()[0] == 0:
+        cursor.execute("INSERT INTO status_ia (id, rsi, potencial, decisao) VALUES (1, 50, 0, 'AGUARDAR')")
 
-        # --- FUNÇÕES DE MEMÓRIA ---
+    conn.commit()
+    conn.close()
+
+def salvar_trade(symbol, tipo, preco, quantidade, lucro):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO trades (symbol, tipo, preco, quantidade, lucro) VALUES (?, ?, ?, ?, ?)", 
+                   (symbol, tipo, preco, quantidade, lucro))
+    conn.commit()
+    conn.close()
 
 def salvar_estado(saldo, posicao, preco_compra, qtd_btc, preco_maximo):
-    """Grava o estado atual no disco"""
-    try:
-        conn = conectar()
-        cursor = conn.cursor()
-        data_hora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        
-        # Atualiza a ÚNICA linha (id=1)
-        cursor.execute('''
-            UPDATE memoria_bot 
-            SET saldo=?, posicao=?, preco_compra=?, qtd_btc=?, preco_maximo=?, ultima_atualizacao=?
-            WHERE id=1
-        ''', (saldo, posicao, preco_compra, qtd_btc, preco_maximo, data_hora))
-        
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        print(f"Erro ao salvar estado: {e}")
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        UPDATE memoria_bot 
+        SET saldo=?, posicao=?, preco_compra=?, qtd_btc=?, preco_maximo=? 
+        WHERE id=1
+    ''', (saldo, int(posicao), preco_compra, qtd_btc, preco_maximo))
+    conn.commit()
+    conn.close()
 
 def carregar_estado():
-    """Lê o último estado gravado ao iniciar"""
     try:
-        conn = conectar()
+        conn = get_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT saldo, posicao, preco_compra, qtd_btc, preco_maximo FROM memoria_bot WHERE id=1")
-        dados = cursor.fetchone()
+        cursor.execute("SELECT * FROM memoria_bot WHERE id=1")
+        row = cursor.fetchone()
         conn.close()
         
-        if dados:
+        if row:
             return {
-                "saldo": dados[0],
-                "posicao": bool(dados[1]), # Converte 0/1 pra True/False
-                "preco_compra": dados[2],
-                "qtd_btc": dados[3],
-                "preco_maximo": dados[4]
+                'saldo': row[1],
+                'posicao': row[2],
+                'preco_compra': row[3],
+                'qtd_btc': row[4],
+                'preco_maximo': row[5]
             }
         return None
-    except Exception as e:
-        print(f"Erro ao carregar estado: {e}")
+    except:
         return None
 
-def salvar_trade(symbol, tipo, preco, quantidade, lucro=0.0):
-    try:
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-        data_hora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        cursor.execute('''
-            INSERT INTO trades (symbol, tipo, preco, quantidade, lucro, data_hora)
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', (symbol, tipo, preco, quantidade, lucro, data_hora))
-        conn.commit()
-        conn.close()
-        print(f"💾 Trade registrado: {tipo} @ ${preco:.2f}")
-    except Exception as e:
-        print(f"Erro ao salvar trade: {e}")
-
-def atualizar_status_ia(rsi, potencial, decisao):
-    try:
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-        data_hora = datetime.now().strftime("%H:%M:%S")
-        
-        # Limpa o status antigo e põe o novo (sempre teremos só 1 linha)
-        cursor.execute("DELETE FROM status_ia")
-        cursor.execute('''
-            INSERT INTO status_ia (rsi, potencial, decisao, atualizado_em)
-            VALUES (?, ?, ?, ?)
-        ''', (rsi, potencial, decisao, data_hora))
-        
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        print(f"Erro ao salvar status IA: {e}")
+def atualizar_status_ia(rsi, score, decisao):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        UPDATE status_ia 
+        SET rsi=?, potencial=?, decisao=?, timestamp=CURRENT_TIMESTAMP 
+        WHERE id=1
+    ''', (rsi, score, decisao))
+    conn.commit()
+    conn.close()

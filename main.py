@@ -1,9 +1,10 @@
-import time
-import schedule
-import ccxt
+import asyncio
+import json
 import os
 import logging
 from datetime import datetime
+import ccxt.async_support as ccxt  # Versão Assíncrona (Turbo)
+import websockets
 from dotenv import load_dotenv
 
 # Módulos Locais
@@ -11,7 +12,7 @@ from modules.database import criar_tabelas, salvar_trade, atualizar_status_ia, s
 import modules.brain as brain
 import modules.notifier as notifier
 
-# --- CONFIGURAÇÃO DE LOG E ENV ---
+# --- CONFIGURAÇÃO ---
 logging.basicConfig(
     filename='bot.log', 
     level=logging.INFO, 
@@ -19,145 +20,198 @@ logging.basicConfig(
 )
 load_dotenv()
 
-# --- PARÂMETROS ---
+# Parâmetros
 SYMBOL = os.getenv('TRADING_PAIR', 'BTC/BRL') 
 STOP_LOSS = 1.5      
 TRAILING_DROP = 0.5  
 LUCRO_MINIMO = 0.2   
-TEMPO_PAUSA = 30 # Minutos de Cooldown
+TAXA_TOTAL = 0.2
+TEMPO_PAUSA = 30 # Minutos
 
-# Variáveis de Estado
-SALDO = 100.00       
-POSICAO = False
-PRECO_COMPRA = 0.0
-QTD_BTC = 0.0
-PRECO_MAXIMO = 0.0   
-EM_COOLDOWN = False
-HORA_STOP = None
+# Variáveis de Estado (Globais)
+ESTADO = {
+    "saldo": 100.00,
+    "posicao": False,
+    "preco_compra": 0.0,
+    "qtd": 0.0,
+    "preco_maximo": 0.0,
+    "cooldown": False,
+    "hora_stop": None,
+    "preco_atual": 0.0  # Atualizado via WebSocket
+}
 
-print("🤖 TRADERBOT V3 ROBUST - DISCORD EDITION")
-logging.info("Sistema Iniciado")
+print("⚡ TRADERBOT V4 - REAL-TIME WEBSOCKETS INICIADO")
+logging.info("Sistema Async Iniciado")
 criar_tabelas() 
 
-# --- CARREGAR MEMÓRIA ---
+# --- NOTIFICAÇÃO DE INÍCIO ---
+notifier.enviar_discord(
+    "🟢 SISTEMA ONLINE", 
+    f"O TraderBot V4 iniciou com sucesso!\n**Par:** {SYMBOL}\n**Modo:** WebSockets Real-Time", 
+    0x00ff00
+)
+
+# Carregar Memória
 memoria = carregar_estado()
 if memoria:
-    SALDO = memoria['saldo']
-    POSICAO = bool(memoria['posicao'])
-    PRECO_COMPRA = memoria['preco_compra']
-    QTD_BTC = memoria['qtd_btc']
-    PRECO_MAXIMO = memoria['preco_maximo']
-    print(f"💾 Memória Restaurada | Saldo: R$ {SALDO:.2f}")
+    ESTADO["saldo"] = memoria['saldo']
+    ESTADO["posicao"] = bool(memoria['posicao'])
+    ESTADO["preco_compra"] = memoria['preco_compra']
+    ESTADO["qtd"] = memoria['qtd_btc']
+    ESTADO["preco_maximo"] = memoria['preco_maximo']
+    print(f"💾 Memória Restaurada | Saldo: R$ {ESTADO['saldo']:.2f}")
 
-def get_dados_robustos():
-    """Busca dados de 1m E 15m para análise completa"""
+# --- FUNÇÕES DE OPERAÇÃO (ASSÍNCRONAS) ---
+
+async def executar_venda(exchange, motivo):
+    """Executa venda imediatamente e notifica"""
+    global ESTADO
+    preco = ESTADO["preco_atual"]
+    
+    # Cálculos
+    valor_bruto = ESTADO["qtd"] * preco
+    lucro_bruto_reais = valor_bruto - (ESTADO["qtd"] * ESTADO["preco_compra"])
+    lucro_bruto_pct = (lucro_bruto_reais / (ESTADO["qtd"] * ESTADO["preco_compra"])) * 100
+    lucro_liquido_pct = lucro_bruto_pct - TAXA_TOTAL
+    
+    # Atualiza Estado
+    ESTADO["saldo"] = valor_bruto * (1 - (TAXA_TOTAL/100))
+    ESTADO["posicao"] = False
+    ESTADO["qtd"] = 0.0
+    ESTADO["preco_compra"] = 0.0
+    ESTADO["preco_maximo"] = 0.0
+    
+    # Salva
+    salvar_estado(ESTADO["saldo"], False, 0, 0, 0)
+    salvar_trade(SYMBOL, "VENDA", preco, 0, lucro_bruto_reais * (1 - (TAXA_TOTAL/100)))
+
+    # Log e Notificação
+    msg = f"**Motivo:** {motivo}\n**Lucro Líquido:** {lucro_liquido_pct:.2f}%\n**Saldo:** R$ {ESTADO['saldo']:.2f}"
+    print(f"\n🚨 VENDA FLASH: {lucro_liquido_pct:.2f}% ({motivo})")
+    notifier.enviar_discord("🚨 VENDA REAL-TIME", msg, 0x00ff00 if lucro_liquido_pct > 0 else 0xff0000)
+
+    # Cooldown
+    if lucro_liquido_pct < 0:
+        print(f"❄️ Entrando em Cooldown de {TEMPO_PAUSA}min")
+        ESTADO["cooldown"] = True
+        ESTADO["hora_stop"] = datetime.now()
+        notifier.enviar_discord("❄️ COOLDOWN ATIVADO", f"Pausando por {TEMPO_PAUSA} min.", 0x0000ff)
+
+async def executar_compra(exchange, analise):
+    """Executa compra"""
+    global ESTADO
+    preco = ESTADO["preco_atual"]
+    
+    ESTADO["preco_compra"] = preco
+    ESTADO["qtd"] = ESTADO["saldo"] / preco
+    ESTADO["posicao"] = True
+    ESTADO["preco_maximo"] = preco
+    
+    salvar_estado(ESTADO["saldo"], True, preco, ESTADO["qtd"], preco)
+    salvar_trade(SYMBOL, "COMPRA", preco, ESTADO["qtd"], 0)
+    
+    msg = f"**Preço:** R$ {preco:.2f}\n**Score:** {analise['score']}\n**Motivos:** {', '.join(analise['motivos'])}"
+    print(f"\n🚀 COMPRA: {msg}")
+    notifier.enviar_discord("🚀 COMPRA DETECTADA", msg, 0x00ff00)
+    
+    atualizar_status_ia(analise['rsi'], analise['score'], "COMPRA")
+
+# --- CORE 1: O VIGILANTE (WEBSOCKET) ---
+async def vigilante_preco(exchange):
+    """Ouve o preço em tempo real e aciona Stops instantaneamente"""
+    symbol_lower = SYMBOL.replace('/', '').lower()
+    stream_url = f"wss://stream.binance.com:9443/ws/{symbol_lower}@miniTicker"
+    
+    print(f"👂 Conectando ao fluxo real-time: {stream_url}")
+    
+    async with websockets.connect(stream_url) as ws:
+        while True:
+            try:
+                data = await ws.recv()
+                json_data = json.loads(data)
+                
+                # Atualiza Preço Global (C = Close Price do miniTicker)
+                price = float(json_data['c'])
+                ESTADO["preco_atual"] = price
+                
+                # --- VERIFICAÇÃO DE SEGURANÇA (A CADA TICK) ---
+                if ESTADO["posicao"]:
+                    # Atualiza Topo (Trailing)
+                    if price > ESTADO["preco_maximo"]:
+                        ESTADO["preco_maximo"] = price
+                    
+                    # Cálculos
+                    recuo = ((price - ESTADO["preco_maximo"]) / ESTADO["preco_maximo"]) * 100
+                    lucro_bruto = ((price - ESTADO["preco_compra"]) / ESTADO["preco_compra"]) * 100
+                    lucro_liq = lucro_bruto - TAXA_TOTAL
+
+                    # CHECAGEM DE SAÍDA IMEDIATA
+                    if lucro_liq > LUCRO_MINIMO and recuo <= -TRAILING_DROP:
+                        await executar_venda(exchange, f"Trailing Stop (Tick)")
+                    elif lucro_bruto <= -STOP_LOSS:
+                        await executar_venda(exchange, f"Stop Loss (Tick)")
+                
+                # Log visual minimalista na mesma linha
+                print(f"⚡ {price:.2f} | P: {ESTADO['posicao']} | Saldo: {ESTADO['saldo']:.2f}", end='\r')
+
+            except Exception as e:
+                print(f"Erro no WebSocket: {e}")
+                await asyncio.sleep(5) # Tenta reconectar
+
+# --- CORE 2: O ESTRATEGISTA (LOOP PERIÓDICO) ---
+async def estrategista_cerebro(exchange):
+    """A cada 10s, baixa velas históricas e roda o Brain V3"""
+    while True:
+        try:
+            # Se já está posicionado, o Vigilante cuida da venda.
+            if not ESTADO["posicao"]:
+                
+                # 1. Verifica Cooldown
+                if ESTADO["cooldown"]:
+                    tempo = (datetime.now() - ESTADO["hora_stop"]).total_seconds() / 60
+                    if tempo >= TEMPO_PAUSA:
+                        ESTADO["cooldown"] = False
+                        notifier.enviar_discord("🔥 RETORNO", "Cooldown finalizado.", 0xffff00)
+                    else:
+                        atualizar_status_ia(0, 0, "GELADEIRA")
+                        await asyncio.sleep(10)
+                        continue
+
+                # 2. Busca Dados (IO Assíncrono)
+                candles_1m = await exchange.fetch_ohlcv(SYMBOL, timeframe='1m', limit=100)
+                candles_15m = await exchange.fetch_ohlcv(SYMBOL, timeframe='15m', limit=100)
+                
+                if candles_1m and candles_15m:
+                    # 3. Analisa (Brain é síncrono/CPU, mas é rápido)
+                    analise = brain.analisar_multitimeframe(candles_1m, candles_15m)
+                    
+                    # Atualiza Dashboard
+                    atualizar_status_ia(analise['rsi'], analise['score'], analise['decisao'])
+                    
+                    # 4. Decide
+                    if analise['decisao'] == "COMPRA":
+                        await executar_compra(exchange, analise)
+
+            await asyncio.sleep(10) 
+
+        except Exception as e:
+            logging.error(f"Erro Estrategista: {e}")
+            print(f"\n❌ Erro Strategy: {e}")
+            await asyncio.sleep(5)
+
+# --- ORQUESTRAÇÃO ---
+async def main():
+    exchange = ccxt.binance({'enableRateLimit': True})
+    
+    tarefa_vigilante = asyncio.create_task(vigilante_preco(exchange))
+    tarefa_estrategista = asyncio.create_task(estrategista_cerebro(exchange))
+    
+    await asyncio.gather(tarefa_vigilante, tarefa_estrategista)
+    
+    await exchange.close()
+
+if __name__ == "__main__":
     try:
-        exchange = ccxt.binance({'enableRateLimit': True}) 
-        # Pega 100 velas para a TA-Lib calcular com precisão
-        candles_1m = exchange.fetch_ohlcv(SYMBOL, timeframe='1m', limit=100)
-        candles_15m = exchange.fetch_ohlcv(SYMBOL, timeframe='15m', limit=100)
-        
-        if not candles_1m or not candles_15m: return None, None, None
-        
-        preco_atual = candles_1m[-1][4]
-        return candles_1m, candles_15m, preco_atual
-    except Exception as e:
-        logging.error(f"Erro API Binance: {e}")
-        return None, None, None
-
-def vender(preco, motivo):
-    global SALDO, POSICAO, QTD_BTC, PRECO_COMPRA, PRECO_MAXIMO, EM_COOLDOWN, HORA_STOP
-    
-    valor_venda = QTD_BTC * preco
-    lucro_reais = valor_venda - (QTD_BTC * PRECO_COMPRA)
-    lucro_pct = (lucro_reais / (QTD_BTC * PRECO_COMPRA)) * 100
-    
-    SALDO = valor_venda
-    POSICAO = False
-    
-    salvar_estado(SALDO, POSICAO, 0, 0, 0)
-    salvar_trade(SYMBOL, "VENDA", preco, 0, lucro_reais)
-    
-    # Notificação Discord
-    cor = 0x00ff00 if lucro_pct > 0 else 0xff0000
-    msg = f"**Motivo:** {motivo}\n**Lucro:** {lucro_pct:.2f}%\n**Novo Saldo:** R$ {SALDO:.2f}"
-    notifier.enviar_discord("🚨 VENDA EXECUTADA", msg, cor)
-    
-    print(f"\n🚨 VENDA: {lucro_pct:.2f}% ({motivo})")
-    logging.info(f"Venda: {lucro_pct:.2f}% | {motivo}")
-
-    # Cooldown se houver prejuízo
-    if lucro_pct < 0:
-        print(f"❄️ Entrando em Cooldown por {TEMPO_PAUSA}min")
-        notifier.enviar_discord("❄️ COOLDOWN ATIVADO", f"Pausando operações por {TEMPO_PAUSA} minutos devido a prejuízo.", 0x0000ff)
-        EM_COOLDOWN = True
-        HORA_STOP = datetime.now()
-
-def job():
-    global SALDO, POSICAO, PRECO_COMPRA, QTD_BTC, PRECO_MAXIMO, EM_COOLDOWN, HORA_STOP
-    
-    c_1m, c_15m, preco = get_dados_robustos()
-    if not preco: return
-    
-    # Analisa com Brain V3
-    analise = brain.analisar_multitimeframe(c_1m, c_15m)
-    
-    status = "POSICIONADO" if POSICAO else f"SCORE: {analise['score']}/10"
-    if EM_COOLDOWN: status = "❄️ COOLDOWN"
-    
-    print(f"⏱️ {datetime.now().strftime('%H:%M:%S')} | {status} | Tendência 15m: {analise['tendencia_macro']} | Decisão: {analise['decisao']}", end='\r')
-    
-    # --- GESTÃO DE POSIÇÃO ---
-    if POSICAO:
-        if preco > PRECO_MAXIMO:
-            PRECO_MAXIMO = preco
-            salvar_estado(SALDO, POSICAO, PRECO_COMPRA, QTD_BTC, PRECO_MAXIMO)
-
-        recuo_pct = ((preco - PRECO_MAXIMO) / PRECO_MAXIMO) * 100
-        lucro_pct = ((preco - PRECO_COMPRA) / PRECO_COMPRA) * 100
-
-        if lucro_pct > LUCRO_MINIMO and recuo_pct <= -TRAILING_DROP:
-            vender(preco, "Trailing Stop")
-        elif lucro_pct <= -STOP_LOSS:
-            vender(preco, "Stop Loss")
-            
-    else:
-        # Verifica Cooldown
-        if EM_COOLDOWN:
-            if (datetime.now() - HORA_STOP).total_seconds() / 60 >= TEMPO_PAUSA:
-                EM_COOLDOWN = False
-                notifier.enviar_discord("🔥 VOLTANDO AO JOGO", "Cooldown finalizado. Retomando análises.", 0xffff00)
-            return
-
-        # SINAL DE COMPRA
-        if analise['decisao'] == "COMPRA":
-            msg = f"**Preço:** R$ {preco:.2f}\n**Score:** {analise['score']}\n**Motivos:** {', '.join(analise['motivos'])}"
-            notifier.enviar_discord("🚀 COMPRA DETECTADA", msg, 0x00ff00)
-            
-            print(f"\n🚀 COMPRA: {msg}")
-            logging.info(f"Compra: {preco}")
-            
-            PRECO_COMPRA = preco
-            QTD_BTC = SALDO / preco
-            POSICAO = True
-            PRECO_MAXIMO = preco
-            
-            salvar_estado(SALDO, POSICAO, PRECO_COMPRA, QTD_BTC, PRECO_MAXIMO)
-            salvar_trade(SYMBOL, "COMPRA", preco, QTD_BTC, 0)
-            
-        # Atualiza Dashboard
-        atualizar_status_ia(analise['rsi'], analise['score'], analise['decisao'])
-
-# Roda a cada 10s
-schedule.every(10).seconds.do(job)
-
-print("🚀 Executando primeira análise agora...")
-job()
-
-while True:
-    try:
-        schedule.run_pending()
-        time.sleep(1)
-    except Exception as e:
-        logging.error(f"Erro Fatal: {e}")
-        time.sleep(5)
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n🛑 Bot encerrado.")
