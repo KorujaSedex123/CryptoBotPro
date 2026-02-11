@@ -1,0 +1,40 @@
+# --- SEGURANÇA (CRÍTICO) ---
+.env
+.env.local
+.env.*.local
+keys.json
+secrets.py
+
+# --- PYTHON (BACKEND) ---
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/
+.venv/
+*.log
+bot.log
+
+# --- NODE.JS / NEXT.JS (FRONTEND) ---
+node_modules/
+.next/
+out/
+build/
+dist/
+.vercel/
+
+# --- DADOS LOCAIS (Não subir histórico pessoal) ---
+trades.db
+*.sqlite3
+*.db
+
+# --- ARQUIVOS DE SISTEMA / IDE ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# --- ARQUIVOS PESADOS / BINÁRIOS ---
+*.whl
+*.rar
+*.zip
