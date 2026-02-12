@@ -8,7 +8,11 @@ import websockets
 from dotenv import load_dotenv
 
 # Módulos Locais
-from modules.database import criar_tabelas, salvar_trade, atualizar_status_ia, salvar_estado, carregar_estado
+from modules.database import (
+    criar_tabelas, salvar_trade, atualizar_status_ia, 
+    salvar_estado, carregar_estado, carregar_configs_globais, 
+    criar_tabela_configs, resetar_comando_venda, obter_ultimo_saldo
+)
 from modules.backtest import otimizar_estrategia 
 import modules.brain as brain
 import modules.notifier as notifier
@@ -21,29 +25,74 @@ logging.basicConfig(
 )
 load_dotenv()
 
-# Parâmetros de Seleção de Elite
-CANDIDATOS = os.getenv('TRADING_PAIRS', 'BTC/BRL,ETH/BRL,SOL/BRL,BNB/BRL,ADA/BRL').split(',')
-LIMITE_ELITE = 3  
-STOP_LOSS = 1.5      
-TRAILING_DROP = 0.5  
-TAXA_TOTAL = 0.2
-TEMPO_PAUSA = 30 
-
-# Estado Global V5.2
-ESTADO = {
-    "ativos_ativos": [], # Símbolos selecionados para o dia
-    "ativos_data": {},
-    "precos_live": {},
-    "configs": {} 
+# --- DEFINIÇÃO DE PERFIS DE RISCO ---
+PERFIS = {
+    "conservador": {
+        "STOP_LOSS": 1.0,
+        "TRAILING_DROP": 0.2,
+        "LUCRO_MINIMO": 0.1,
+        "SCORE_MINIMO": 8,
+        "RSI_COMPRA": 30
+    },
+    "moderado": {
+        "STOP_LOSS": 1.5,
+        "TRAILING_DROP": 0.5,
+        "LUCRO_MINIMO": 0.2,
+        "SCORE_MINIMO": 6,
+        "RSI_COMPRA": 35
+    },
+    "agressivo": {
+        "STOP_LOSS": 3.0,
+        "TRAILING_DROP": 1.0,
+        "LUCRO_MINIMO": 0.4,
+        "SCORE_MINIMO": 5,
+        "RSI_COMPRA": 45
+    }
 }
 
-print(f"🔍 SISTEMA DE RANKING: Analisando {len(CANDIDATOS)} ativos candidatos...")
-criar_tabelas() 
+# Parâmetros Iniciais
+CANDIDATOS = os.getenv('TRADING_PAIRS', 'BTC/BRL,ETH/BRL,SOL/BRL,BNB/BRL,ADA/BRL').split(',')
+LIMITE_ELITE = 3  
+TAXA_TOTAL = 0.2
+
+# Estado Global de Operação
+ESTADO = {
+    "ativos_ativos": [],
+    "ativos_data": {},
+    "precos_live": {},
+    "configs_ia": {},
+    "bot_rodando": True,
+    "modo_producao": False,
+    "perfil_ativo": "moderado"
+}
+
+# --- FUNÇÃO DE SINCRONIZAÇÃO DE CONFIGURAÇÕES ---
+
+async def sincronizar_configs():
+    """Lê o banco de dados a cada 10s para atualizar o comportamento do bot"""
+    global ESTADO
+    while True:
+        try:
+            db_configs = carregar_configs_globais()
+            ESTADO["bot_rodando"] = db_configs.get('bot_rodando') == 'true'
+            ESTADO["modo_producao"] = db_configs.get('modo_producao') == 'true'
+            ESTADO["perfil_ativo"] = db_configs.get('perfil_risco', 'moderado')
+            
+            # Verificar Comando de Venda Total (Botão de Pânico)
+            if db_configs.get('comando_venda_total') == 'true':
+                print("\n🚨 COMANDO DE EMERGÊNCIA: Vendendo todos os ativos!")
+                for sym in ESTADO["ativos_ativos"]:
+                    if ESTADO["ativos_data"][sym]["posicao"]:
+                        await executar_venda(sym, "Venda Manual (Dashboard)")
+                resetar_comando_venda() # Volta o comando para 'false' no banco e evita loop
+                
+        except Exception as e:
+            logging.error(f"Erro ao sincronizar configs: {e}")
+        await asyncio.sleep(10)
 
 # --- FUNÇÕES DE OPERAÇÃO ---
 
 async def executar_venda(symbol, motivo):
-    global ESTADO
     dados = ESTADO["ativos_data"][symbol]
     preco = ESTADO["precos_live"][symbol]
     
@@ -53,12 +102,15 @@ async def executar_venda(symbol, motivo):
     dados["saldo"] = valor_bruto * (1 - (TAXA_TOTAL/100))
     dados["posicao"] = False
     
+    # Se estivesse em Produção Real, aqui iria a chamada exchange.create_order(...)
+    
     salvar_estado(symbol, dados["saldo"], False, 0, 0, 0)
     salvar_trade(symbol, "VENDA", preco, 0, lucro_reais)
-    notifier.enviar_discord(f"🚨 VENDA: {symbol}", f"Motivo: {motivo}\nLucro: R$ {lucro_reais:.2f}", 0xff0000)
+    
+    cor = 0x00ff00 if lucro_reais > 0 else 0xff0000
+    notifier.enviar_discord(f"🚨 VENDA: {symbol}", f"Motivo: {motivo}\nLucro: R$ {lucro_reais:.2f}", cor)
 
 async def executar_compra(symbol, analise):
-    global ESTADO
     dados = ESTADO["ativos_data"][symbol]
     preco = ESTADO["precos_live"][symbol]
     
@@ -67,9 +119,12 @@ async def executar_compra(symbol, analise):
     dados["posicao"] = True
     dados["preco_maximo"] = preco
     
+    # Se estivesse em Produção Real, aqui iria a chamada exchange.create_order(...)
+    
     salvar_estado(symbol, dados["saldo"], True, preco, dados["qtd"], preco)
     salvar_trade(symbol, "COMPRA", preco, dados["qtd"], 0)
-    notifier.enviar_discord(f"🚀 COMPRA: {symbol}", f"Score IA: {analise['score']}/10", 0x00ff00)
+    
+    notifier.enviar_discord(f"🚀 COMPRA: {symbol}", f"Score IA: {analise['score']}/10\nPerfil: {ESTADO['perfil_ativo'].upper()}", 0x00ff00)
     atualizar_status_ia(symbol, analise['rsi'], analise['score'], "COMPRA")
 
 # --- CORE: VIGILANTE E ESTRATEGISTA ---
@@ -83,6 +138,11 @@ async def vigilante_multi_preco():
     async with websockets.connect(url) as ws:
         while True:
             try:
+                # Se o bot estiver pausado, ele ignora o processamento
+                if not ESTADO["bot_rodando"]:
+                    await asyncio.sleep(1)
+                    continue
+
                 data = await ws.recv()
                 msg = json.loads(data)
                 symbol_raw = msg['s'] 
@@ -94,39 +154,55 @@ async def vigilante_multi_preco():
                         
                         dados = ESTADO["ativos_data"][sym]
                         if dados["posicao"]:
-                            if price > dados["preco_maximo"]: dados["preco_maximo"] = price
+                            if price > dados["preco_maximo"]: 
+                                dados["preco_maximo"] = price
+                                salvar_estado(sym, dados["saldo"], True, dados["preco_compra"], dados["qtd"], price)
+
+                            # Carrega as regras do Perfil Ativo Dinamicamente
+                            regra = PERFIS[ESTADO["perfil_ativo"]]
+                            
                             recuo = ((price - dados["preco_maximo"]) / dados["preco_maximo"]) * 100
                             lucro = ((price - dados["preco_compra"]) / dados["preco_compra"]) * 100
                             
-                            if (lucro - TAXA_TOTAL) > 0.2 and recuo <= -TRAILING_DROP:
+                            if (lucro - TAXA_TOTAL) > regra["LUCRO_MINIMO"] and recuo <= -regra["TRAILING_DROP"]:
                                 await executar_venda(sym, "Trailing Stop")
-                            elif lucro <= -STOP_LOSS:
+                            elif lucro <= -regra["STOP_LOSS"]:
                                 await executar_venda(sym, "Stop Loss")
                 
-                print(f"⚡ Live: " + " | ".join([f"{k}:{v:.0f}" for k,v in ESTADO["precos_live"].items()]), end='\r')
+                status_bot = "🟢 RODANDO" if ESTADO["bot_rodando"] else "🔴 PAUSADO"
+                print(f"[{status_bot}] Perfil: {ESTADO['perfil_ativo'].upper()} | " + " | ".join([f"{k}:{v:.0f}" for k,v in ESTADO["precos_live"].items()]), end='\r')
             except:
                 await asyncio.sleep(5)
 
 async def estrategista_cerebro(exchange):
     while True:
         try:
+            if not ESTADO["bot_rodando"]:
+                await asyncio.sleep(5)
+                continue
+
             for sym in ESTADO["ativos_ativos"]:
                 dados = ESTADO["ativos_data"][sym]
                 if not dados["posicao"]:
                     c1m = await exchange.fetch_ohlcv(sym, timeframe='1m', limit=100)
                     c15m = await exchange.fetch_ohlcv(sym, timeframe='15m', limit=100)
                     
-                    config = ESTADO["configs"].get(sym)
+                    config = ESTADO["configs_ia"].get(sym)
                     analise = brain.analisar_multitimeframe(c1m, c15m, config=config)
                     atualizar_status_ia(sym, analise['rsi'], analise['score'], analise['decisao'])
                     
-                    if analise['decisao'] == "COMPRA":
+                    # Filtro de Perfil de Risco para Compra
+                    regra = PERFIS[ESTADO["perfil_ativo"]]
+                    
+                    if analise['decisao'] == "COMPRA" and analise['score'] >= regra["SCORE_MINIMO"]:
                         await executar_compra(sym, analise)
+            
             await asyncio.sleep(10)
         except Exception as e:
             logging.error(f"Erro Estrategista: {e}")
             await asyncio.sleep(5)
 
+# --- AGENDADOR DE RELATÓRIO DIÁRIO ---
 ESTADO_RELATORIO = {"ultimo_envio": None}
 async def agendador_relatorio():
     """Verifica a cada minuto se é hora de enviar o resumo diário"""
@@ -145,50 +221,36 @@ async def agendador_relatorio():
                 
                 ESTADO_RELATORIO["ultimo_envio"] = hoje
         
-        await asyncio.sleep(60) # Verifica a cada minuto
-# --- FASE DE SELEÇÃO DE ELITE ---
+        await asyncio.sleep(60)
 
 async def main():
-    # Instancia a exchange apenas uma vez
+    criar_tabelas()
+    criar_tabela_configs()
     exchange = ccxt.binance({'enableRateLimit': True})
     
-    # LOOP DE CALIBRAÇÃO INFINITO
+    # 1. LOOP DE CALIBRAÇÃO INICIAL
     while True:
         ranking = []
         print(f"\n🔍 [CALIBRAÇÃO] Analisando {len(CANDIDATOS)} candidatos...")
-        
-        # Faz o backtest de todos
         for sym in CANDIDATOS:
             config, lucro = await otimizar_estrategia(exchange, sym)
-            # Salva o resultado para o Dashboard mostrar o relatório
             atualizar_status_ia(sym, 0, lucro, "OBSERVAÇÃO" if lucro <= 0 else "ELITE")
-            
             if lucro > 0:
                 ranking.append({'symbol': sym, 'config': config, 'lucro': lucro})
         
-        # Tenta selecionar a Elite
         elite_data = sorted(ranking, key=lambda x: x['lucro'], reverse=True)[:LIMITE_ELITE]
         ESTADO["ativos_ativos"] = [item['symbol'] for item in elite_data]
 
-        # SE NÃO ACHOU NADA LUCRATIVO:
         if not ESTADO["ativos_ativos"]:
-            print("⚠️ Nenhuma moeda lucrativa no momento. Aguardando 15 minutos para re-calibrar...")
-            # Avisa no Discord uma vez a cada ciclo de espera
-            notifier.enviar_discord("😴 MODO ESPERA", "Nenhuma oportunidade real detectada. Vou tentar novamente em 15 min.", 0x71717a)
-            
-            # Dorme por 15 minutos antes de tentar o Ranking de novo
-            await asyncio.sleep(900) 
-            continue # Volta para o topo do 'while True' para tentar de novo
-        
-        # SE ACHOU ELITE: Sai do loop de calibração inicial para começar o trade
+            print("⚠️ Nenhuma moeda lucrativa. Aguardando 15 min...")
+            await asyncio.sleep(900)
+            continue
         break
 
-    # --- INICIALIZAÇÃO DA ELITE (IGUAL AO ANTERIOR) ---
-    print(f"🏆 ELITE DO DIA SELECIONADA: {ESTADO['ativos_ativos']}")
-    
+    # 2. INICIALIZAÇÃO DOS DADOS (CARTEIRA REAL)
     for sym in ESTADO["ativos_ativos"]:
         memoria = carregar_estado(sym)
-        ESTADO["configs"][sym] = next(item['config'] for item in elite_data if item['symbol'] == sym)
+        ESTADO["configs_ia"][sym] = next(item['config'] for item in elite_data if item['symbol'] == sym)
         ESTADO["precos_live"][sym] = 0.0
         
         if memoria:
@@ -198,14 +260,25 @@ async def main():
                 "preco_maximo": memoria['preco_maximo']
             }
         else:
+            # FIX: Carrega o último saldo acumulado do banco em vez de resetar para 100
+            ultimo_saldo = obter_ultimo_saldo(sym)
             ESTADO["ativos_data"][sym] = {
-                "saldo": 100.0, "posicao": False, "preco_compra": 0.0, "qtd": 0.0, "preco_maximo": 0.0
+                "saldo": ultimo_saldo, 
+                "posicao": False, 
+                "preco_compra": 0, 
+                "qtd": 0, 
+                "preco_maximo": 0
             }
 
-    notifier.enviar_discord("✅ ELITE ATIVADA", f"Bot operando: {', '.join(ESTADO['ativos_ativos'])}", 0x00ff00)
+    notifier.enviar_discord("✅ SISTEMA V6.0 ONLINE", f"Perfil: {ESTADO['perfil_ativo'].upper()}\nAtivos: {', '.join(ESTADO['ativos_ativos'])}", 0x00ff00)
     
-    # Inicia os motores
-    await asyncio.gather(vigilante_multi_preco(), estrategista_cerebro(exchange),agendador_relatorio())
+    # 3. MOTORES
+    await asyncio.gather(
+        vigilante_multi_preco(), 
+        estrategista_cerebro(exchange),
+        sincronizar_configs(), # Monitoramento de Comandos (Pause/Panic)
+        agendador_relatorio()  # Relatório Diário
+    )
     await exchange.close()
 
 if __name__ == "__main__":

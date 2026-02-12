@@ -1,121 +1,141 @@
 "use client";
 import { useEffect, useRef } from "react";
-import { createChart, ColorType, CandlestickSeries } from "lightweight-charts";
+import { 
+  createChart, 
+  ColorType, 
+  IChartApi, 
+  ISeriesApi, 
+  CandlestickSeries, 
+  Time,
+  SeriesMarker 
+} from "lightweight-charts";
 
-export default function CryptoChart({ symbol, trades }: { symbol: string, trades?: any[] }) {
+interface CryptoChartProps {
+  symbol: string;
+  trades: any[];
+}
+
+export default function CryptoChart({ symbol, trades }: CryptoChartProps) {
   const chartContainerRef = useRef<HTMLDivElement>(null);
-  const chartRef = useRef<any>(null);
-  const seriesRef = useRef<any>(null);
+  const chartApiRef = useRef<IChartApi | null>(null);
+  const seriesApiRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
 
+  // 1. EFEITO MESTRE: Criação e Gerenciamento do Gráfico
   useEffect(() => {
     if (!chartContainerRef.current) return;
 
+    // --- SETUP DO GRÁFICO ---
     const chart = createChart(chartContainerRef.current, {
       layout: {
         background: { type: ColorType.Solid, color: "transparent" },
-        textColor: "#A1A1AA",
+        textColor: "#71717a",
+      },
+      grid: {
+        vertLines: { color: "rgba(42, 46, 57, 0.1)" },
+        horzLines: { color: "rgba(42, 46, 57, 0.1)" },
       },
       width: chartContainerRef.current.clientWidth,
       height: 300,
-      grid: {
-        vertLines: { color: "#27272a" },
-        horzLines: { color: "#27272a" },
-      },
       timeScale: {
         timeVisible: true,
         secondsVisible: false,
+        borderColor: "#27272a",
+      },
+      rightPriceScale: {
+        borderColor: "#27272a",
       },
     });
 
-    chartRef.current = chart;
-
+    // Cria a Série usando a classe da V4
     const newSeries = chart.addSeries(CandlestickSeries, {
-      upColor: "#4ade80", 
-      downColor: "#f87171",
-      borderVisible: false, 
-      wickUpColor: "#4ade80", 
-      wickDownColor: "#f87171",
+      upColor: "#10b981",
+      downColor: "#ef4444",
+      borderUpColor: "#10b981",
+      borderDownColor: "#ef4444",
+      wickUpColor: "#10b981",
+      wickDownColor: "#ef4444",
     });
 
-    seriesRef.current = newSeries;
+    // Salva nas Refs
+    chartApiRef.current = chart;
+    seriesApiRef.current = newSeries;
 
-    const fetchBinanceData = async () => {
+    // --- CARREGAMENTO DE DADOS (CANDLES) ---
+    const fetchCandles = async () => {
       try {
-        // Converte o par (BTC/BRL -> BTCBRL) para a API da Binance
-        const binancePair = symbol.replace("/", "");
-        const res = await fetch(`https://api.binance.com/api/v3/klines?symbol=${binancePair}&interval=1m&limit=100`);
+        const res = await fetch(`https://api.binance.com/api/v3/klines?symbol=${symbol.replace('/', '')}&interval=15m&limit=100`);
         const data = await res.json();
         
         const candles = data.map((d: any) => ({
-          time: d[0] / 1000,
+          time: (d[0] / 1000) as Time,
           open: parseFloat(d[1]),
           high: parseFloat(d[2]),
           low: parseFloat(d[3]),
           close: parseFloat(d[4]),
         }));
-        
-        newSeries.setData(candles);
-      } catch (error) { 
-        console.error("Erro ao carregar dados da Binance:", error); 
+
+        // Verifica se a série ainda existe antes de setar dados
+        if (seriesApiRef.current) {
+          seriesApiRef.current.setData(candles);
+        }
+      } catch (e) {
+        console.error("Erro chart:", e);
       }
     };
 
-    fetchBinanceData();
-    const interval = setInterval(fetchBinanceData, 2000);
+    fetchCandles();
 
-    const handleResize = () => {
-        if (chartRef.current && chartContainerRef.current) {
-            chartRef.current.applyOptions({ width: chartContainerRef.current.clientWidth });
-        }
-    };
-    window.addEventListener("resize", handleResize);
+    // --- RESPONSIVIDADE ---
+    const resizeObserver = new ResizeObserver((entries) => {
+      if (entries.length === 0 || !entries[0].target || !chartApiRef.current) return;
+      const { width } = entries[0].contentRect;
+      chartApiRef.current.applyOptions({ width });
+    });
+    resizeObserver.observe(chartContainerRef.current);
 
+    // --- CLEANUP ---
     return () => {
-      clearInterval(interval);
-      window.removeEventListener("resize", handleResize);
-      chart.remove();
-      seriesRef.current = null;
+      resizeObserver.disconnect();
+      if (chartApiRef.current) {
+        chartApiRef.current.remove();
+        chartApiRef.current = null;
+        seriesApiRef.current = null;
+      }
     };
-  }, [symbol]); // O gráfico reinicia completamente quando mudas o ativo
+  }, [symbol]);
 
+  // 2. EFEITO SECUNDÁRIO: Atualização dos Marcadores (Trades)
   useEffect(() => {
-    if (!seriesRef.current || !trades) return;
+    // Verificação de Segurança
+    if (!seriesApiRef.current || !trades) return;
 
     try {
-        // Filtra os marcadores para mostrar apenas os do ativo selecionado
-        const markers = trades
-          .filter((t: any) => t.symbol === symbol)
-          .map((t: any) => {
-            const time = new Date(t.data_hora).getTime() / 1000; 
-            return {
-                time: time,
-                position: t.tipo === 'COMPRA' ? 'belowBar' : 'aboveBar',
-                color: t.tipo === 'COMPRA' ? '#4ade80' : '#f87171',
-                shape: t.tipo === 'COMPRA' ? 'arrowUp' : 'arrowDown',
-                text: t.tipo === 'COMPRA' ? 'C' : 'V',
-                size: 2,
-            };
-        });
-        
-        markers.sort((a: any, b: any) => a.time - b.time);
+      // Ordena os trades por data (Obrigatório na V4)
+      const sortedTrades = [...trades].sort((a, b) => new Date(a.data_hora).getTime() - new Date(b.data_hora).getTime());
 
-        if (typeof seriesRef.current.setMarkers === 'function') {
-            seriesRef.current.setMarkers(markers);
-        }
+      // Tipagem explícita dos marcadores
+      const markers: SeriesMarker<Time>[] = sortedTrades.map((t) => ({
+        time: (new Date(t.data_hora).getTime() / 1000) as Time,
+        position: t.tipo === 'COMPRA' ? 'belowBar' : 'aboveBar',
+        color: t.tipo === 'COMPRA' ? '#10b981' : '#ef4444',
+        shape: t.tipo === 'COMPRA' ? 'arrowUp' : 'arrowDown',
+        text: t.tipo === 'COMPRA' ? 'Buy' : `Sell (${t.lucro > 0 ? '+' : ''}${t.lucro.toFixed(2)})`,
+      }));
 
-    } catch (e) {
-        console.error("Erro ao atualizar marcadores:", e);
+      // AQUI ESTÁ A CORREÇÃO: Usamos 'as any' para o TypeScript parar de reclamar
+      // A função existe no objeto, mas a tipagem ISeriesApi às vezes não a expõe corretamente.
+      (seriesApiRef.current as any).setMarkers(markers);
+      
+    } catch (error) {
+      console.warn("Erro ao plotar markers:", error);
     }
   }, [trades, symbol]);
 
   return (
-    <div className="w-full bg-zinc-900/50 border border-zinc-800 rounded-2xl p-4 backdrop-blur-sm shadow-xl">
+    <div className="bg-zinc-900/50 border border-zinc-800 rounded-2xl p-4 backdrop-blur-sm">
       <div className="flex justify-between items-center mb-4">
-         <div className="flex items-center gap-2">
-            <div className="w-2 h-2 bg-yellow-500 rounded-full"></div>
-            <h3 className="text-sm font-semibold text-zinc-300">{symbol}</h3>
-         </div>
-         <span className="text-[10px] bg-emerald-500/10 text-emerald-400 px-2 py-1 rounded-full animate-pulse">● Live Stream</span>
+        <h3 className="text-xs font-bold text-zinc-400 uppercase tracking-widest">Gráfico {symbol} (15m)</h3>
+        <span className="text-[9px] text-zinc-600 bg-zinc-800 px-2 py-1 rounded">Live Binance Data</span>
       </div>
       <div ref={chartContainerRef} className="w-full h-[300px]" />
     </div>
