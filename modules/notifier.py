@@ -29,7 +29,7 @@ def enviar_discord(titulo, mensagem, cor=0x00ff00, marcar_usuario=True):
                 "title": titulo,
                 "description": mensagem,
                 "color": cor,
-                "footer": {"text": f"TraderBot V4 • {datetime.now().strftime('%H:%M:%S')}"}
+                "footer": {"text": f"TraderBot Pro V5.3 • Elite Ranking Ativo • {datetime.now().strftime('%H:%M:%S')}"}
             }]
         }
         
