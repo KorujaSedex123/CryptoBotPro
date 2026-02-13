@@ -1,0 +1,12 @@
+version: '3.8'
+
+services:
+  traderbot:
+    build: .
+    container_name: traderbot_v6
+    restart: always  # Se o bot cair ou der erro, ele reinicia sozinho!
+    volumes:
+      - ./trades.db:/app/trades.db  # Persiste o banco de dados fora do container
+      - ./bot.log:/app/bot.log      # Persiste os logs
+    env_file:
+      - .env  # Carrega suas configurações

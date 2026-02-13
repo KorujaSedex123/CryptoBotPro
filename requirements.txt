@@ -1,0 +1,7 @@
+ccxt
+websockets
+python-dotenv
+pandas
+pandas_ta
+scikit-learn
+numpy

@@ -184,8 +184,8 @@ async def estrategista_cerebro(exchange):
             for sym in ESTADO["ativos_ativos"]:
                 dados = ESTADO["ativos_data"][sym]
                 if not dados["posicao"]:
-                    c1m = await exchange.fetch_ohlcv(sym, timeframe='1m', limit=100)
-                    c15m = await exchange.fetch_ohlcv(sym, timeframe='15m', limit=100)
+                    c1m = await exchange.fetch_ohlcv(sym, timeframe='1m', limit=500)
+                    c15m = await exchange.fetch_ohlcv(sym, timeframe='15m', limit=500)
                     
                     config = ESTADO["configs_ia"].get(sym)
                     analise = brain.analisar_multitimeframe(c1m, c15m, config=config)
